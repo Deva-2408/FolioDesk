@@ -1,0 +1,6 @@
+{
+  "name": "FolioDesk",
+  "description": "Precision PDF workbench for students and professionals: reorder pages, merge PDFs, invert dark slides to printable white, impose multi-page N-up layouts, and extract text with high-accuracy OCR.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
