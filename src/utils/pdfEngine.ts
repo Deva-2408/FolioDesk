@@ -17,6 +17,12 @@ import {
 } from "./cropMath";
 import { computeImpositionPlan } from "./layoutMath";
 import { getEffectiveDimensions } from "./pageOperations";
+import {
+  COMPRESSION_PRESETS,
+  computePlacementRenderScale,
+  computeVectorDrawPlacement,
+  shouldRecompressHeavySource,
+} from "./pdfCompression";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -356,11 +362,12 @@ function sanitizePdfText(text: string): string {
   return text.replace(/[^\x20-\x7E\xA0-\xFF\n]/g, " ");
 }
 
-async function canvasToPngBytes(canvas: HTMLCanvasElement): Promise<Uint8Array> {
+async function canvasToJpegBytes(canvas: HTMLCanvasElement, quality = 0.78): Promise<Uint8Array> {
+  const q = Math.max(0.4, Math.min(0.95, quality));
   const blob = await new Promise<Blob | null>((resolve) =>
-    canvas.toBlob((b) => resolve(b), "image/png"),
+    canvas.toBlob((b) => resolve(b), "image/jpeg", q),
   );
-  if (!blob) throw new Error("Failed to encode rendered page as PNG.");
+  if (!blob) throw new Error("Failed to encode rendered page as JPEG.");
   return new Uint8Array(await blob.arrayBuffer());
 }
 
@@ -416,7 +423,15 @@ export async function createUnlockedPdfBytes(
     onProgress?.(i, proxy.numPages);
     const pdfPage = await proxy.getPage(i);
     const baseVp = pdfPage.getViewport({ scale: 1 });
-    const renderVp = pdfPage.getViewport({ scale: 2.25 });
+    const renderScale = computePlacementRenderScale({
+      croppedWidthPt: baseVp.width,
+      croppedHeightPt: baseVp.height,
+      drawWidthPt: baseVp.width,
+      drawHeightPt: baseVp.height,
+      targetDpiScale: 1.65,
+      maxLongEdgePx: 1900,
+    });
+    const renderVp = pdfPage.getViewport({ scale: renderScale });
 
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(renderVp.width));
@@ -428,10 +443,10 @@ export async function createUnlockedPdfBytes(
       await pdfPage.render({ canvas, canvasContext: ctx, viewport: renderVp }).promise;
     }
 
-    const pngBytes = await canvasToPngBytes(canvas);
-    const pngImg = await outDoc.embedPng(pngBytes);
+    const jpegBytes = await canvasToJpegBytes(canvas, 0.8);
+    const jpegImg = await outDoc.embedJpg(jpegBytes);
     const outPage = outDoc.addPage([baseVp.width, baseVp.height]);
-    outPage.drawImage(pngImg, {
+    outPage.drawImage(jpegImg, {
       x: 0,
       y: 0,
       width: baseVp.width,
@@ -441,7 +456,7 @@ export async function createUnlockedPdfBytes(
     await overlayDecryptedTextLayer(pdfPage, outPage, helvetica);
   }
 
-  return outDoc.save();
+  return outDoc.save({ useObjectStreams: true, addDefaultPage: false });
 }
 
 function drawBlankLinesPdf(
@@ -528,6 +543,38 @@ export async function exportEditedPdf(
     return loaded;
   };
 
+  const preset = COMPRESSION_PRESETS[options.compressionPreset ?? "balanced"];
+  const targetDpiScale = options.renderDpiScale ?? preset.dpiScale;
+  const jpegQuality = options.jpegQuality ?? preset.jpegQuality;
+  const maxLongEdgePx = options.maxLongEdgePx ?? preset.maxLongEdgePx;
+  const compressHeavyPages = options.compressHeavyPages ?? preset.defaultCompressHeavyPages;
+
+  // Deduplicate embedded JPEG images & vector XObjects when pages are duplicated or reused
+  const embeddedImageCache = new Map<string, Awaited<ReturnType<PDFDocument["embedJpg"]>>>();
+  const embeddedVectorCache = new Map<string, Awaited<ReturnType<PDFDocument["embedPage"]>>>();
+
+  const getEmbeddedRasterImage = async (
+    item: PdfPageItem,
+    scale: number,
+  ): Promise<Awaited<ReturnType<PDFDocument["embedJpg"]>>> => {
+    const cropKey = item.crop
+      ? `${item.crop.top}:${item.crop.right}:${item.crop.bottom}:${item.crop.left}`
+      : "0";
+    const key = `${item.sourceId}|${item.sourcePageIndex}|${item.rotation}|${cropKey}|${item.invertMode}|${scale}|${jpegQuality}`;
+    const cached = embeddedImageCache.get(key);
+    if (cached) return cached;
+
+    const canvas = await renderPageToCanvas(item, sourcesById, {
+      scale,
+      applyInvert: true,
+      applyCrop: true,
+    });
+    const jpegBytes = await canvasToJpegBytes(canvas, jpegQuality);
+    const embedded = await outDoc.embedJpg(jpegBytes);
+    embeddedImageCache.set(key, embedded);
+    return embedded;
+  };
+
   const { layout } = options;
   const useImposition =
     layout.customGrid ||
@@ -544,8 +591,9 @@ export async function exportEditedPdf(
       onProgress?.(i + 1, total, `Building page ${i + 1} of ${total}...`);
       const eff = getCroppedDimensions(item);
       const src = sourcesById.get(item.sourceId);
+      const recompressHeavy = shouldRecompressHeavySource(src, compressHeavyPages);
       const mustRasterize =
-        item.invertMode !== "none" || Boolean(src?.wasEncrypted);
+        item.invertMode !== "none" || Boolean(src?.wasEncrypted) || recompressHeavy;
 
       let outPage: ReturnType<PDFDocument["addPage"]>;
 
@@ -553,23 +601,24 @@ export async function exportEditedPdf(
         outPage = outDoc.addPage([eff.width, eff.height]);
         drawBlankLinesPdf(outPage, 0, 0, eff.width, eff.height, item.blankStyle ?? "blank");
       } else if (mustRasterize) {
-        // High-DPI decrypted/inverted/cropped render
-        const canvas = await renderPageToCanvas(item, sourcesById, {
-          scale: Math.max(options.renderDpiScale, src?.wasEncrypted ? 2.25 : options.renderDpiScale),
-          applyInvert: true,
-          applyCrop: true,
+        const renderScale = computePlacementRenderScale({
+          croppedWidthPt: eff.width,
+          croppedHeightPt: eff.height,
+          drawWidthPt: eff.width,
+          drawHeightPt: eff.height,
+          targetDpiScale,
+          maxLongEdgePx,
         });
-        const pngBytes = await canvasToPngBytes(canvas);
-        const pngImage = await outDoc.embedPng(pngBytes);
+        const jpgImage = await getEmbeddedRasterImage(item, renderScale);
         outPage = outDoc.addPage([eff.width, eff.height]);
-        outPage.drawImage(pngImage, {
+        outPage.drawImage(jpgImage, {
           x: 0,
           y: 0,
           width: eff.width,
           height: eff.height,
         });
-        // Preserve searchable text when decrypting an uncropped, unrotated encrypted page
-        if (src?.wasEncrypted && !hasActiveCrop(item.crop) && item.rotation === 0) {
+        // Preserve searchable text when decrypting or compressing an uncropped, unrotated page
+        if ((src?.wasEncrypted || recompressHeavy) && src && !hasActiveCrop(item.crop) && item.rotation === 0) {
           const proxy = await getPdfProxy(src);
           const pdfPage = await proxy.getPage(item.sourcePageIndex + 1);
           await overlayDecryptedTextLayer(pdfPage, outPage, helvetica);
@@ -634,11 +683,10 @@ export async function exportEditedPdf(
         const item = pagesToExport[placement.pageIndex];
         const src = sourcesById.get(item.sourceId);
         const pdfDrawY = sheetPlan.sheetHeight - placement.drawY - placement.drawHeight;
+        const recompressHeavy = shouldRecompressHeavySource(src, compressHeavyPages);
+        // Pure vector imposition now natively supports crop AND rotation without rasterizing!
         const mustRasterize =
-          item.invertMode !== "none" ||
-          item.rotation !== 0 ||
-          hasActiveCrop(item.crop) ||
-          Boolean(src?.wasEncrypted);
+          item.invertMode !== "none" || Boolean(src?.wasEncrypted) || recompressHeavy;
 
         if (item.kind === "blank") {
           drawBlankLinesPdf(
@@ -650,14 +698,17 @@ export async function exportEditedPdf(
             item.blankStyle ?? "blank",
           );
         } else if (mustRasterize) {
-          const canvas = await renderPageToCanvas(item, sourcesById, {
-            scale: options.renderDpiScale,
-            applyInvert: true,
-            applyCrop: true,
+          const croppedDims = getCroppedDimensions(item);
+          const placementScale = computePlacementRenderScale({
+            croppedWidthPt: croppedDims.width,
+            croppedHeightPt: croppedDims.height,
+            drawWidthPt: placement.drawWidth,
+            drawHeightPt: placement.drawHeight,
+            targetDpiScale,
+            maxLongEdgePx,
           });
-          const pngBytes = await canvasToPngBytes(canvas);
-          const pngImage = await outDoc.embedPng(pngBytes);
-          outPage.drawImage(pngImage, {
+          const jpgImage = await getEmbeddedRasterImage(item, placementScale);
+          outPage.drawImage(jpgImage, {
             x: placement.drawX,
             y: pdfDrawY,
             width: placement.drawWidth,
@@ -666,12 +717,38 @@ export async function exportEditedPdf(
         } else {
           const srcDoc = await getSourcePdfLib(item.sourceId);
           const srcPage = srcDoc.getPage(item.sourcePageIndex);
-          const embedded = await outDoc.embedPage(srcPage);
+          const existingRot = ((srcPage.getRotation().angle % 360) + 360) % 360;
+          const totalRot = (existingRot + item.rotation) % 360;
+          const mediaBox = srcPage.getCropBox() ?? srcPage.getMediaBox();
+          const box = hasActiveCrop(item.crop)
+            ? computeNativePdfCropBox(mediaBox, totalRot, item.crop)
+            : mediaBox;
+
+          const vecKey = `${item.sourceId}|${item.sourcePageIndex}|${box.x.toFixed(2)}:${box.y.toFixed(2)}:${box.width.toFixed(2)}:${box.height.toFixed(2)}`;
+          let embedded = embeddedVectorCache.get(vecKey);
+          if (!embedded) {
+            embedded = await outDoc.embedPage(srcPage, {
+              left: box.x,
+              bottom: box.y,
+              right: box.x + box.width,
+              top: box.y + box.height,
+            });
+            embeddedVectorCache.set(vecKey, embedded);
+          }
+
+          const drawPose = computeVectorDrawPlacement(
+            placement.drawX,
+            pdfDrawY,
+            placement.drawWidth,
+            placement.drawHeight,
+            totalRot,
+          );
           outPage.drawPage(embedded, {
-            x: placement.drawX,
-            y: pdfDrawY,
-            width: placement.drawWidth,
-            height: placement.drawHeight,
+            x: drawPose.x,
+            y: drawPose.y,
+            width: drawPose.width,
+            height: drawPose.height,
+            ...(drawPose.rotateDeg !== 0 ? { rotate: degrees(drawPose.rotateDeg) } : {}),
           });
         }
 
@@ -747,7 +824,7 @@ export async function exportEditedPdf(
     }
   }
 
-  const bytes = await outDoc.save();
+  const bytes = await outDoc.save({ useObjectStreams: true, addDefaultPage: false });
   const safeName = options.filename.trim().endsWith(".pdf")
     ? options.filename.trim()
     : `${options.filename.trim() || "foliodesk-export"}.pdf`;

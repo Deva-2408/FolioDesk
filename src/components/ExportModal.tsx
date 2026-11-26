@@ -1,7 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Download, X, Loader2, CheckCircle2, AlertCircle } from "lucide-react";
-import type { NUpLayoutConfig, PdfPageItem, SourceDocument } from "../types/pdf";
+import type {
+  ExportCompressionPreset,
+  NUpLayoutConfig,
+  PdfPageItem,
+  SourceDocument,
+} from "../types/pdf";
 import { computeImpositionPlan } from "../utils/layoutMath";
+import {
+  COMPRESSION_PRESETS,
+  computeSizeSavings,
+  formatFileSize,
+  shouldRecompressHeavySource,
+} from "../utils/pdfCompression";
 import { exportEditedPdf, triggerFileDownload } from "../utils/pdfEngine";
 
 interface ExportModalProps {
@@ -15,6 +26,8 @@ interface ExportModalProps {
   defaultFilename: string;
 }
 
+const PRESET_ORDER: ExportCompressionPreset[] = ["compact", "balanced", "high"];
+
 export function ExportModal({
   open,
   onClose,
@@ -27,11 +40,13 @@ export function ExportModal({
 }: ExportModalProps) {
   const [filename, setFilename] = useState(defaultFilename);
   const [selectedOnly, setSelectedOnly] = useState(false);
-  const [dpiScale, setDpiScale] = useState(2.0);
+  const [compressionPreset, setCompressionPreset] = useState<ExportCompressionPreset>("balanced");
+  const [compressHeavyPages, setCompressHeavyPages] = useState(false);
   const [includeOcrLayer, setIncludeOcrLayer] = useState(embedOcrTextLayer);
   const [isExporting, setIsExporting] = useState(false);
   const [progressText, setProgressText] = useState("");
   const [resultSummary, setResultSummary] = useState<string | null>(null);
+  const [lastExportBytes, setLastExportBytes] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   useEffect(() => {
@@ -39,6 +54,7 @@ export function ExportModal({
       setFilename(defaultFilename);
       setIncludeOcrLayer(embedOcrTextLayer);
       setResultSummary(null);
+      setLastExportBytes(null);
       setErrorMsg(null);
       setSelectedOnly(false);
     }
@@ -53,12 +69,38 @@ export function ExportModal({
     return () => window.removeEventListener("keydown", onKey);
   }, [open, isExporting, onClose]);
 
+  const targetPages = useMemo(
+    () =>
+      selectedOnly && selectedIds.size > 0
+        ? pages.filter((p) => selectedIds.has(p.id))
+        : pages,
+    [pages, selectedOnly, selectedIds],
+  );
+
+  // Estimate proportional bytes contributed by the exported pages' source PDFs
+  const sourceReferenceBytes = useMemo(() => {
+    let total = 0;
+    for (const p of targetPages) {
+      if (p.kind !== "pdf") continue;
+      const src = sourcesById.get(p.sourceId);
+      if (src && src.pageCount > 0) {
+        total += src.byteLength / src.pageCount;
+      }
+    }
+    return Math.round(total);
+  }, [targetPages, sourcesById]);
+
+  const hasHeavySource = useMemo(
+    () =>
+      targetPages.some((p) =>
+        shouldRecompressHeavySource(sourcesById.get(p.sourceId), true),
+      ),
+    [targetPages, sourcesById],
+  );
+
   if (!open) return null;
 
-  const targetPages =
-    selectedOnly && selectedIds.size > 0
-      ? pages.filter((p) => selectedIds.has(p.id))
-      : pages;
+  const activePreset = COMPRESSION_PRESETS[compressionPreset];
   const invertedCount = targetPages.filter((p) => p.invertMode !== "none").length;
   const croppedCount = targetPages.filter(
     (p) =>
@@ -77,6 +119,11 @@ export function ExportModal({
     layout.orientation !== "auto";
   const outputSheets = useNUp ? plan.sheets.length : targetPages.length;
 
+  const handleSelectPreset = (next: ExportCompressionPreset) => {
+    setCompressionPreset(next);
+    setCompressHeavyPages(COMPRESSION_PRESETS[next].defaultCompressHeavyPages);
+  };
+
   const handleExport = async (e: React.FormEvent) => {
     e.preventDefault();
     if (isExporting || targetPages.length === 0) return;
@@ -84,7 +131,8 @@ export function ExportModal({
     setIsExporting(true);
     setErrorMsg(null);
     setResultSummary(null);
-    setProgressText("Preparing document...");
+    setLastExportBytes(null);
+    setProgressText("Optimizing & building PDF...");
 
     try {
       const result = await exportEditedPdf(
@@ -96,17 +144,25 @@ export function ExportModal({
           selectedOnly,
           selectedIds: new Set(selectedIds),
           embedOcrTextLayer: includeOcrLayer,
-          renderDpiScale: dpiScale,
+          renderDpiScale: activePreset.dpiScale,
+          compressionPreset,
+          jpegQuality: activePreset.jpegQuality,
+          maxLongEdgePx: activePreset.maxLongEdgePx,
+          compressHeavyPages,
         },
         (_cur, _tot, label) => setProgressText(label),
       );
 
       triggerFileDownload(result.bytes, result.filename, "application/pdf");
-      const sizeKb = (result.bytes.byteLength / 1024).toFixed(1);
+      setLastExportBytes(result.bytes.byteLength);
+      const formattedSize = formatFileSize(result.bytes.byteLength);
+      const savings = computeSizeSavings(sourceReferenceBytes, result.bytes.byteLength);
+      const savingsNote =
+        savings && savings.deltaPercent >= 5 ? ` · ${savings.label}` : "";
       setResultSummary(
         `Downloaded ${result.filename} (${result.sheetCount} ${
           result.sheetCount === 1 ? "sheet" : "sheets"
-        }, ${sizeKb} KB).`,
+        }, ${formattedSize}${savingsNote}).`,
       );
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : "Export failed.");
@@ -123,8 +179,8 @@ export function ExportModal({
       aria-modal="true"
       aria-labelledby="export-modal-title"
     >
-      <div className="w-full max-w-lg rounded-xl bg-white border border-slate-200 shadow-xl overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200">
+      <div className="w-full max-w-lg rounded-xl bg-white border border-slate-200 shadow-xl overflow-hidden max-h-[92vh] flex flex-col">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-slate-200 shrink-0">
           <h2 id="export-modal-title" className="text-base font-semibold text-slate-900">
             Export Edited PDF
           </h2>
@@ -139,7 +195,7 @@ export function ExportModal({
           </button>
         </div>
 
-        <form onSubmit={handleExport} className="p-5 space-y-5">
+        <form onSubmit={handleExport} className="p-5 space-y-4 overflow-y-auto">
           {/* Output Filename */}
           <div>
             <label htmlFor="export-filename" className="block text-xs font-semibold text-slate-800 mb-1.5">
@@ -186,42 +242,84 @@ export function ExportModal({
             </div>
           )}
 
-          {/* Render Quality for Inverted / Encrypted Pages */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label htmlFor="export-dpi-select" className="block text-xs font-semibold text-slate-800 mb-1.5">
-                Raster quality (inverted / decrypted)
-              </label>
-              <select
-                id="export-dpi-select"
-                value={dpiScale}
-                onChange={(e) => setDpiScale(Number(e.target.value))}
-                className="w-full rounded-lg border border-slate-300 bg-white px-2.5 py-2 text-xs text-slate-800"
-              >
-                <option value={1.5}>Standard (110 DPI · Compact)</option>
-                <option value={2.0}>Print Crisp (150 DPI · Recommended)</option>
-                <option value={2.75}>High Resolution (200 DPI)</option>
-              </select>
+          {/* File Size & Compression Presets */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="block text-xs font-semibold text-slate-800">
+                File size &amp; compression
+              </span>
+              <span className="text-[11px] text-slate-500">
+                Vector pages stay lossless · JPEG for rasters
+              </span>
             </div>
+            <div
+              className="grid grid-cols-3 gap-2"
+              role="radiogroup"
+              aria-label="Export compression level"
+            >
+              {PRESET_ORDER.map((presetId) => {
+                const cfg = COMPRESSION_PRESETS[presetId];
+                const selected = compressionPreset === presetId;
+                return (
+                  <button
+                    key={presetId}
+                    type="button"
+                    role="radio"
+                    aria-checked={selected}
+                    onClick={() => handleSelectPreset(presetId)}
+                    className={`p-2.5 rounded-lg border text-left transition-colors ${
+                      selected
+                        ? "border-blue-600 bg-blue-50/50 text-slate-900"
+                        : "border-slate-200 bg-white text-slate-700 hover:border-slate-300"
+                    }`}
+                  >
+                    <div className="text-xs font-semibold leading-tight">{cfg.label}</div>
+                    <div className="text-[10px] text-slate-500 mt-0.5">{cfg.badge}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-[11px] text-slate-500 leading-relaxed">
+              {activePreset.description}
+            </p>
+          </div>
 
-            <div className="flex items-end pb-1">
-              <label className="inline-flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={includeOcrLayer}
-                  onChange={(e) => setIncludeOcrLayer(e.target.checked)}
-                  className="rounded border-slate-300 text-blue-600"
-                />
-                <span>Embed extracted OCR text layer</span>
-              </label>
-            </div>
+          {/* Additional Optimization Checkboxes */}
+          <div className="space-y-2 pt-1">
+            <label className="flex items-start gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={compressHeavyPages}
+                onChange={(e) => setCompressHeavyPages(e.target.checked)}
+                className="mt-0.5 rounded border-slate-300 text-blue-600"
+              />
+              <span>
+                Shrink heavy scans &amp; image-dense pages
+                {hasHeavySource && (
+                  <span className="text-blue-600 font-medium"> (recommended for this file)</span>
+                )}
+              </span>
+            </label>
+
+            <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={includeOcrLayer}
+                onChange={(e) => setIncludeOcrLayer(e.target.checked)}
+                className="rounded border-slate-300 text-blue-600"
+              />
+              <span>Embed extracted OCR text layer</span>
+            </label>
           </div>
 
           {/* Summary Strip */}
           <div className="rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-xs text-slate-600 space-y-1 font-mono tabular-nums">
             <div className="flex justify-between">
               <span>Input pages</span>
-              <span className="font-semibold text-slate-900">{targetPages.length}</span>
+              <span className="font-semibold text-slate-900">
+                {targetPages.length}
+                {sourceReferenceBytes > 0 ? ` (${formatFileSize(sourceReferenceBytes)} source)` : ""}
+              </span>
             </div>
             <div className="flex justify-between">
               <span>Output layout</span>
@@ -239,6 +337,14 @@ export function ExportModal({
                 {croppedCount} cropped · {invertedCount} inverted
               </span>
             </div>
+            {lastExportBytes !== null && (
+              <div className="flex justify-between text-blue-700 pt-1 border-t border-slate-200">
+                <span>Exported file size</span>
+                <span className="font-semibold" data-testid="exported-file-size">
+                  {formatFileSize(lastExportBytes)}
+                </span>
+              </div>
+            )}
             {hasEncryptedSource && (
               <div className="flex justify-between text-emerald-700 pt-1 border-t border-slate-200">
                 <span>Password protection</span>
@@ -248,7 +354,10 @@ export function ExportModal({
           </div>
 
           {resultSummary && (
-            <div className="flex items-start gap-2 rounded-lg bg-emerald-50 border border-emerald-200 px-3.5 py-2.5 text-xs text-emerald-800">
+            <div
+              data-testid="export-result-summary"
+              className="flex items-start gap-2 rounded-lg bg-emerald-50 border border-emerald-200 px-3.5 py-2.5 text-xs text-emerald-800"
+            >
               <CheckCircle2 className="h-4 w-4 text-emerald-600 shrink-0 mt-0.5" />
               <span>{resultSummary}</span>
             </div>

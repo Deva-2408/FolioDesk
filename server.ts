@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import fs from "fs";
+import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
@@ -8,8 +9,41 @@ import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === "production";
+const disableHmr = process.env.DISABLE_HMR === "true";
+
+function parseCliArg(flag: string): string | undefined {
+  const argv = process.argv.slice(2);
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === flag && argv[i + 1]) {
+      return argv[i + 1];
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      return arg.slice(flag.length + 1);
+    }
+  }
+  return undefined;
+}
+
+function resolveServerPort(): number {
+  const cliPort = Number(parseCliArg("--port") ?? parseCliArg("-p"));
+  if (Number.isInteger(cliPort) && cliPort > 0 && cliPort < 65536) {
+    return cliPort;
+  }
+  const envPort = Number(process.env.PORT);
+  // In dev inside the preview container, PORT=8080 may belong to the outer nginx proxy;
+  // default to 3000 unless explicitly set to another port or running in production.
+  if (Number.isInteger(envPort) && envPort > 0 && envPort < 65536) {
+    if (isProduction || envPort !== 8080) {
+      return envPort;
+    }
+  }
+  return 3000;
+}
+
+const PORT = resolveServerPort();
+const HOST = parseCliArg("--host") || "0.0.0.0";
 
 function getGeminiClient(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -332,12 +366,20 @@ async function startServer() {
     }
   });
 
+  const httpServer = http.createServer(app);
+  let viteServer: { close: () => Promise<void> } | null = null;
+
   if (!isProduction) {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: disableHmr ? false : { server: httpServer },
+        watch: disableHmr ? null : undefined,
+      },
       appType: "spa",
     });
+    viteServer = vite;
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, "dist");
@@ -349,9 +391,28 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`FolioDesk server running at http://localhost:${PORT}`);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once("error", reject);
+    httpServer.listen(PORT, HOST, () => {
+      httpServer.off("error", reject);
+      console.log(`FolioDesk server running at http://localhost:${PORT}`);
+      resolve();
+    });
   });
+
+  const shutdown = () => {
+    httpServer.close(() => {
+      if (viteServer) {
+        viteServer.close().finally(() => process.exit(0));
+      } else {
+        process.exit(0);
+      }
+    });
+    setTimeout(() => process.exit(0), 2000).unref();
+  };
+
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
 }
 
 startServer().catch((err) => {

@@ -153,6 +153,8 @@ export interface ActiveEditSummaryItem {
   label: string;
 }
 
+export type ExportCompressionPreset = "compact" | "balanced" | "high";
+
 export interface ExportOptions {
   filename: string;
   layout: NUpLayoutConfig;
@@ -160,4 +162,9 @@ export interface ExportOptions {
   selectedIds: Set<string>;
   embedOcrTextLayer: boolean;
   renderDpiScale: number;
+  compressionPreset?: ExportCompressionPreset;
+  jpegQuality?: number;
+  maxLongEdgePx?: number;
+  compressHeavyPages?: boolean;
 }
+
